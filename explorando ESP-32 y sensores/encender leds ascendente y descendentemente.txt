@@ -1,0 +1,23 @@
+from machine import Pin   ###se importa desde la libreria Machine pin
+from time import sleep		###se importa desde time la funcion sleep
+
+led_pins = [2, 5, 18, 19, 4]	###se toma la secuencia de pines seleccionados  
+leds = [Pin(pin, Pin.OUT) for pin in led_pins]	#recorre la secuencia de los pines 
+
+def encender_secuencial_ascendente():	#enciende los leds de forma secuencial
+    for led in leds:
+        led.on()
+        sleep(0.1)  
+        led.off()   
+
+def encender_secuencial_descendente():	#enciende los leds de forma secuencial descendente      
+    for led in reversed(leds):
+        led.on()
+        sleep(0.1)  
+        led.off()   
+
+while True:  
+    encender_secuencial_descendente()
+    encender_secuencial_ascendente() 
+
+###curiosamente los leds se encienden en el orden que se puso desde la lsita :3

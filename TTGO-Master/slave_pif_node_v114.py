@@ -1,0 +1,632 @@
+# ============================================================
+#  PIF_NODE v11.0 — Plantilla Universal / LAB-ARTE
+# ============================================================
+
+import gc, network, espnow, machine, utime, json
+from machine import Pin, lightsleep, I2C, ADC
+import dht
+import tft_config
+import st7789py as st7789
+import comfortaa_16 as font_sm
+import comfortaa_24 as font_md
+
+gc.collect()
+
+# ───────────────────────────────────────────────
+#  ★ CAMBIAR EN CADA DISPOSITIVO ★
+# ───────────────────────────────────────────────
+NODE_ID = "SLAVE_01"
+
+# ───────────────────────────────────────────────
+#  TIEMPOS
+# ───────────────────────────────────────────────
+SLEEP_MS         = 600_000  # Reposo entre ciclos autónomos (10 min)
+VENTANA_WAVE_MS  = 8_000    # Espera WAVE después de enviar FB autónomo
+VENTANA_HIJOS_MS = 3_000    # Espera FBs de hijos tras propagar WAVE
+CANAL_SCAN_MS    = 2_000    # Tiempo por canal durante el escaneo
+CANAL_MISS_MAX   = 3        # Ciclos sin WAVE antes de re-escanear canal
+BUFFER_MAX       = 5        # Máximo de lecturas acumuladas en buffer
+MAX_TTL          = 6
+BROADCAST_MAC    = b'\xff\xff\xff\xff\xff\xff'
+CANALES_SCAN     = [1, 6, 11]   # Canales WiFi más comunes en México
+
+# ───────────────────────────────────────────────
+#  PINES
+# ───────────────────────────────────────────────
+PIN_DHT11 = 15
+PIN_MQ135 = 34
+PIN_SDA   = 21
+PIN_SCL   = 22
+MPU_ADDR  = 0x68
+
+# ───────────────────────────────────────────────
+#  HARDWARE
+# ───────────────────────────────────────────────
+tft       = tft_config.config(rotation=1)
+backlight = Pin(4, Pin.OUT)
+backlight.value(0)
+
+sensor_dht = dht.DHT11(Pin(PIN_DHT11, Pin.IN))
+sensor_mq  = ADC(Pin(PIN_MQ135))
+sensor_mq.atten(ADC.ATTN_11DB)
+i2c        = I2C(0, sda=Pin(PIN_SDA), scl=Pin(PIN_SCL), freq=400_000)
+
+btn_izq = Pin(0,  Pin.IN, Pin.PULL_UP)
+btn_der = Pin(35, Pin.IN, Pin.PULL_UP)
+
+import esp32 as _esp32
+_esp32.wake_on_ext0(pin=btn_izq, level=_esp32.WAKEUP_ALL_LOW)
+
+# ───────────────────────────────────────────────
+#  COLORES
+# ───────────────────────────────────────────────
+VERDE    = st7789.GREEN
+ROJO     = st7789.RED
+AMARILLO = st7789.YELLOW
+CYAN     = st7789.CYAN
+BLANCO   = st7789.WHITE
+NEGRO    = st7789.BLACK
+GRIS     = st7789.color565(80, 80, 80)
+AZUL     = st7789.color565(80, 160, 255)
+
+# ───────────────────────────────────────────────
+#  ESTADO DEL NODO
+# ───────────────────────────────────────────────
+_t_cache      = "--"
+_h_cache      = "--"
+_mq_cache     = "--"
+_conectado    = False
+_ultimo_padre = "MASTER_TTGO_GATEWAY"
+_rol          = "?"
+_canal_actual = 6
+_ciclos_sin_wave = 0
+_buffer       = []
+
+# Tipo de sensor principal: "DHT11" o "MQ135" — auto-detectado al arrancar
+_sensor_tipo = "DHT11"
+
+# ───────────────────────────────────────────────
+#  AUTO-DETECCIÓN DE SENSOR
+#  Prueba el DHT11 al arrancar. Si responde → modo DHT11.
+#  Si no responde → modo MQ135 (calidad de aire).
+# ───────────────────────────────────────────────
+def detectar_sensor():
+    global _sensor_tipo
+    print("[SENSOR] Detectando DHT11...")
+    utime.sleep_ms(1000)   # estabilización
+    for i in range(3):
+        try:
+            sensor_dht.measure()
+            tv = sensor_dht.temperature()
+            hv = sensor_dht.humidity()
+            if tv is not None and hv is not None and not (tv == 0 and hv == 0):
+                _sensor_tipo = "DHT11"
+                print("[SENSOR] DHT11 OK — modo Temperatura/Humedad")
+                return
+        except Exception as e:
+            print("[SENSOR] DHT11 intento {} fallo: {}".format(i+1, e))
+        utime.sleep_ms(800)
+    _sensor_tipo = "MQ135"
+    print("[SENSOR] DHT11 no responde — modo MQ135 (calidad aire)")
+
+# ───────────────────────────────────────────────
+#  RADIO
+# ───────────────────────────────────────────────
+_sta = network.WLAN(network.STA_IF)
+
+def init_espnow(canal):
+    gc.collect()
+    if not _sta.active():
+        _sta.active(True)
+    _sta.config(channel=canal)
+    utime.sleep_ms(150)
+    en = espnow.ESPNow()
+    en.active(True)
+    en.add_peer(BROADCAST_MAC)
+    return en
+
+def cerrar_espnow(en):
+    try:    en.active(False)
+    except: pass
+    try:    del en
+    except: pass
+    try:    _sta.active(False)
+    except: pass
+    gc.collect()
+
+# ───────────────────────────────────────────────
+#  ESCANEO DE CANAL
+#  Prueba cada canal de CANALES_SCAN durante CANAL_SCAN_MS.
+#  Si recibe una WAVE, lee el campo "ch" y lo adopta.
+#  Si no recibe nada en ningún canal, mantiene el canal actual.
+# ───────────────────────────────────────────────
+def escanear_canal():
+    global _canal_actual
+    print("[SCAN] Buscando canal del Master...")
+    _barra_status("Buscando Master...", AMARILLO)
+
+    for ch in CANALES_SCAN:
+        _sta.active(True)
+        _sta.config(channel=ch)
+        utime.sleep_ms(100)
+        en = espnow.ESPNow()
+        en.active(True)
+        en.add_peer(BROADCAST_MAC)
+
+        fin = utime.ticks_add(utime.ticks_ms(), CANAL_SCAN_MS)
+        encontrado = False
+        while utime.ticks_diff(fin, utime.ticks_ms()) > 0:
+            try: host, msg = en.recv(50)
+            except: continue
+            if not msg: continue
+            try:
+                data = json.loads(msg.decode())
+                if data.get("type") == "WAVE":
+                    # Adoptar el canal que el Master indica en su WAVE
+                    ch_master = data.get("ch", ch)
+                    _canal_actual = ch_master
+                    encontrado = True
+                    print("[SCAN] Master en canal", _canal_actual)
+                    del data
+                    break
+                del data
+            except: pass
+
+        en.active(False)
+        del en
+        _sta.active(False)
+        gc.collect()
+
+        if encontrado:
+            _barra_status("Canal: {}".format(_canal_actual), VERDE)
+            utime.sleep_ms(300)
+            return True
+
+    print("[SCAN] No encontrado, usando ch:", _canal_actual)
+    return False
+
+# ───────────────────────────────────────────────
+#  MPU6050
+# ───────────────────────────────────────────────
+def _s16(v):
+    return v if v < 32768 else v - 65536
+
+def mpu_init():
+    try:
+        i2c.writeto_mem(MPU_ADDR, 0x6B, b'\x00')
+        utime.sleep_ms(80)
+    except: pass
+
+def mpu_leer():
+    try:
+        raw = i2c.readfrom_mem(MPU_ADDR, 0x3B, 6)
+        ax  = round(_s16(raw[0] << 8 | raw[1]) / 16384.0, 2)
+        ay  = round(_s16(raw[2] << 8 | raw[3]) / 16384.0, 2)
+        az  = round(_s16(raw[4] << 8 | raw[5]) / 16384.0, 2)
+        return ax, ay, az
+    except:
+        return None, None, None
+
+# ───────────────────────────────────────────────
+#  SENSORES
+#  Siempre devuelve mediciones — ERR si el sensor falla.
+#  Los valores ERR se reportan al servidor (no se descartan).
+# ───────────────────────────────────────────────
+def leer_sensores():
+    global _t_cache, _h_cache, _mq_cache
+    med = []
+    t, h, mq = "--", "--", "--"
+
+    # DHT11 — solo si es el sensor principal detectado
+    if _sensor_tipo == "DHT11":
+        t, h = "ERR", "ERR"
+        utime.sleep_ms(500)
+        for _ in range(3):
+            try:
+                sensor_dht.measure()
+                tv = sensor_dht.temperature()
+                hv = sensor_dht.humidity()
+                if not (tv == 0 and hv == 0):
+                    t, h = tv, hv
+                    break
+            except: pass
+            utime.sleep_ms(300)
+        _t_cache = t
+        _h_cache = h
+        med.append({"t": "Temp", "v": t})
+        med.append({"t": "Hum",  "v": h})
+
+    # MQ135 — siempre que sea el sensor principal o esté presente
+    if _sensor_tipo == "MQ135":
+        try:
+            mq = sensor_mq.read()
+        except:
+            mq = "ERR"
+        _mq_cache = mq
+        med.append({"t": "MQ135", "v": mq})
+
+    # MPU6050 — opcional, si responde se incluye
+    ax, ay, az = mpu_leer()
+    if ax is not None:
+        med.append({"t": "AccX", "v": ax})
+        med.append({"t": "AccY", "v": ay})
+        med.append({"t": "AccZ", "v": az})
+
+    return med, (t, h, mq, ax, ay)
+
+# ───────────────────────────────────────────────
+#  DISPLAY
+# ───────────────────────────────────────────────
+W = tft.physical_height
+H = tft.physical_width
+
+def cx(font, txt):
+    return max(0, (W - tft.write_width(font, txt)) // 2)
+
+def _barra_status(msg, col=VERDE):
+    tft.fill_rect(0, 108, W, 27, NEGRO)
+    tft.fill_rect(4, 112, 8, 14, col)
+    tft.write(font_sm, msg[:24], 16, 112, col)
+
+def ui_nodo(t, h, mq, ax=None, ay=None, status="", status_col=VERDE):
+    hr, mn, seg = utime.localtime()[3:6]
+    hora = "{:02d}:{:02d}:{:02d}".format(hr, mn, seg)
+    tft.fill(NEGRO)
+    tft.write(font_sm, NODE_ID, 4,   2, CYAN)
+    tft.write(font_sm, hora,    160, 2, GRIS)
+
+    if _sensor_tipo == "DHT11":
+        # Modo Temperatura/Humedad
+        t_col = ROJO if t == "ERR" else AMARILLO
+        h_col = ROJO if h == "ERR" else CYAN
+        tft.write(font_md, "T: {}C".format(t), 4, 22, t_col)
+        tft.write(font_md, "H: {}%".format(h), 4, 52, h_col)
+        extras = ""
+        if ax is not None:
+            extras = "Ax:{:.1f}  Ay:{:.1f}".format(ax, ay)
+        if extras:
+            tft.write(font_sm, extras[:30], 4, 84, BLANCO)
+    else:
+        # Modo MQ135 — calidad de aire
+        mq_col = ROJO if mq == "ERR" else AMARILLO
+        # Categoría aproximada
+        try:
+            mqv = int(mq)
+            if   mqv < 700:  cat, cat_col = "BUENA", VERDE
+            elif mqv < 1500: cat, cat_col = "MODERADA", AMARILLO
+            elif mqv < 2500: cat, cat_col = "MALA", st7789.color565(255, 140, 0)
+            else:            cat, cat_col = "MUY MALA", ROJO
+        except:
+            cat, cat_col = "---", GRIS
+        tft.write(font_sm, "CALIDAD AIRE", 4, 22, GRIS)
+        tft.write(font_md, "{}".format(mq), 4, 42, mq_col)
+        tft.write(font_md, cat,             4, 76, cat_col)
+
+    tft.fill_rect(0, 108, W, 27, NEGRO)
+    tft.fill_rect(4, 112, 8, 14, status_col)
+    tft.write(font_sm, status[:24], 16, 112, status_col)
+
+def ui_bienvenida():
+    tft.fill(NEGRO)
+    tft.write(font_md, "PIF NODE",  cx(font_md, "PIF NODE"),  4,  VERDE)
+    tft.write(font_sm, "LAB-ARTE",  cx(font_sm, "LAB-ARTE"),  44, CYAN)
+    tft.write(font_sm, NODE_ID,     cx(font_sm, NODE_ID),     68, AMARILLO)
+    tft.write(font_sm, "v11.4",     cx(font_sm, "v11.4"),     92, GRIS)
+    backlight.value(1)
+    utime.sleep_ms(2000)
+    backlight.value(0)
+
+def ui_modo_detectado():
+    """Pantalla breve mostrando qué sensor se detectó."""
+    tft.fill(NEGRO)
+    tft.write(font_sm, NODE_ID, cx(font_sm, NODE_ID), 20, CYAN)
+    if _sensor_tipo == "DHT11":
+        tft.write(font_md, "Modo: T/H",     cx(font_md, "Modo: T/H"),     50, VERDE)
+        tft.write(font_sm, "DHT11 detectado", cx(font_sm, "DHT11 detectado"), 88, GRIS)
+    else:
+        tft.write(font_md, "Modo: AIRE",   cx(font_md, "Modo: AIRE"),   50, AMARILLO)
+        tft.write(font_sm, "MQ135 activo",  cx(font_sm, "MQ135 activo"),  88, GRIS)
+    backlight.value(1)
+    utime.sleep_ms(1500)
+
+def ui_sleep_screen():
+    tft.fill(NEGRO)
+    tft.write(font_sm, NODE_ID,      cx(font_sm, NODE_ID),      40, CYAN)
+    con_txt = "conectado" if _conectado else "sin señal"
+    con_col = VERDE if _conectado else GRIS
+    tft.write(font_sm, con_txt,      cx(font_sm, con_txt),      66, con_col)
+    tft.write(font_sm, "sleeping...", cx(font_sm, "sleeping..."), 92, GRIS)
+    backlight.value(0)
+
+# ───────────────────────────────────────────────
+#  BUFFER LOCAL
+# ───────────────────────────────────────────────
+def agregar_al_buffer(mediciones):
+    """Agrega una lectura al buffer. Descarta la más antigua si supera BUFFER_MAX."""
+    hr, mn, seg = utime.localtime()[3:6]
+    ts = "{:02d}:{:02d}:{:02d}".format(hr, mn, seg)
+    _buffer.append({"ts": ts, "pl": mediciones})
+    while len(_buffer) > BUFFER_MAX:
+        _buffer.pop(0)
+
+def payload_completo(mediciones_fresh):
+    """Devuelve un payload combinando buffer acumulado + lectura fresca.
+    El buffer se limpia tras enviarlo."""
+    combined = []
+    # Incluir las lecturas del buffer con timestamp
+    for entry in _buffer:
+        for m in entry["pl"]:
+            combined.append({
+                "t"  : m["t"],
+                "v"  : m["v"],
+                "ts" : entry["ts"]
+            })
+    # Agregar lectura fresca (sin ts para que el Master use su hora)
+    for m in mediciones_fresh:
+        combined.append({"t": m["t"], "v": m["v"]})
+    _buffer.clear()
+    return combined
+
+# ───────────────────────────────────────────────
+#  ESP-NOW — envío y relay
+# ───────────────────────────────────────────────
+def enviar_fb(en, payload, parent_id):
+    pkt = json.dumps({
+        "type": "FB",
+        "id"  : NODE_ID,
+        "par" : parent_id,
+        "pl"  : payload
+    })
+    if len(pkt) > 248:
+        # Truncar payload si excede el límite ESP-NOW
+        pkt = json.dumps({
+            "type": "FB",
+            "id"  : NODE_ID,
+            "par" : parent_id,
+            "pl"  : payload[:3]
+        })
+    try:
+        en.send(BROADCAST_MAC, pkt)
+        print("[FB] → {}  bytes:{}".format(parent_id, len(pkt)))
+    except Exception as e:
+        print("[FB ERR]", e)
+
+def relay_fb_hijo(en, raw_str):
+    try:
+        data = json.loads(raw_str)
+        via  = data.get("via", [])
+        if NODE_ID in via:
+            del data; return
+        via.append(NODE_ID)
+        data["via"] = via
+        relay = json.dumps(data)
+        if len(relay) < 248:
+            en.send(BROADCAST_MAC, relay)
+            print("[RELAY] ← hijo:", data.get("id", "?"))
+        del data, relay
+    except Exception as e:
+        print("[RELAY ERR]", e)
+
+# ───────────────────────────────────────────────
+#  CICLO PRINCIPAL
+# ───────────────────────────────────────────────
+def ciclo(forzar=False):
+    """
+    forzar=True → medición + envío inmediato (botón).
+    forzar=False → ciclo normal: mide, envía autónomo, escucha WAVE.
+    """
+    global _conectado, _ultimo_padre, _rol, _ciclos_sin_wave, _canal_actual
+
+    gc.collect()
+    backlight.value(1)
+    mpu_init()
+
+    # ── Caso botón ─────────────────────────────
+    if forzar:
+        ui_nodo(_t_cache, _h_cache, _mq_cache,
+                status="Midiendo...", status_col=AMARILLO)
+        med, (t, h, mq, ax, ay) = leer_sensores()
+        ui_nodo(t, h, mq, ax, ay, status="Enviando FB...", status_col=AZUL)
+        en = init_espnow(_canal_actual)
+        # Enviar varias veces durante 3s — el Master alterna entre WiFi y mesh,
+        # un único envío puede caer cuando el Master está en WiFi y se pierde.
+        for i in range(5):
+            enviar_fb(en, med, _ultimo_padre)
+            ui_nodo(t, h, mq, ax, ay,
+                    status="Enviando {}/5".format(i+1), status_col=AZUL)
+            utime.sleep_ms(600)
+        _buffer.clear()
+        ui_nodo(t, h, mq, ax, ay, status="Enviado (boton)", status_col=VERDE)
+        utime.sleep_ms(1500)
+        cerrar_espnow(en)
+        ui_sleep_screen()
+        lightsleep(SLEEP_MS)
+        return
+
+    # ── Paso 1: Medir autónomo ──────────────────
+    ui_nodo(_t_cache, _h_cache, _mq_cache,
+            status="Midiendo (auto)...", status_col=GRIS)
+    med, (t, h, mq, ax, ay) = leer_sensores()
+    agregar_al_buffer(med)
+    ui_nodo(t, h, mq, ax, ay,
+            status="Buffer: {}".format(len(_buffer)), status_col=GRIS)
+
+    # ── Paso 2: Enviar FB autónomo ──────────────
+    en = init_espnow(_canal_actual)
+    # 3 envíos espaciados para que al menos uno coincida con la ventana mesh del Master
+    for i in range(3):
+        enviar_fb(en, med, _ultimo_padre)
+        utime.sleep_ms(400)
+    print("[AUTO] FB x3 enviado | buffer:", len(_buffer), "| canal:", _canal_actual)
+
+    # ── Paso 3: Escuchar WAVE brevemente ────────
+    # Ventana corta — si hay una WAVE pendiente del Master, la atendemos.
+    _barra_status("Escuchando WAVE...", GRIS)
+    wave_recibida  = False
+    parent_id      = None
+    wave_cmd       = "REQ:ALL"
+    wave_ttl       = MAX_TTL
+    target         = "ALL"   # default — se sobrescribe si llega WAVE
+
+    fin = utime.ticks_add(utime.ticks_ms(), VENTANA_WAVE_MS)
+    while utime.ticks_diff(fin, utime.ticks_ms()) > 0:
+        try: host, msg = en.recv(30)
+        except: continue
+        if not msg: continue
+        try:
+            txt  = msg.decode()
+            data = json.loads(txt)
+            if data.get("type") == "WAVE":
+                ttl    = data.get("ttl", MAX_TTL)
+                target = data.get("target", "ALL")
+                if ttl <= 0:
+                    del data; continue
+                # Actualizar canal si el Master indica uno diferente
+                ch_master = data.get("ch", _canal_actual)
+                if ch_master != _canal_actual:
+                    _canal_actual = ch_master
+                    print("[CH] Actualizado a", _canal_actual)
+                parent_id     = data.get("from", "MASTER_TTGO_GATEWAY")
+                wave_cmd      = data.get("cmd", "REQ:ALL")
+                wave_ttl      = ttl
+                wave_recibida = True
+                _conectado    = True
+                _ultimo_padre = parent_id
+                _ciclos_sin_wave = 0
+                print("[WAVE] De:{} cmd:{} ttl:{}".format(parent_id, wave_cmd, ttl))
+                del data; break
+            del data
+        except: pass
+
+    # ── Sin WAVE — solo dormimos ────────────────
+    if not wave_recibida:
+        _ciclos_sin_wave += 1
+        _conectado = False
+        print("[NO WAVE] ciclos sin wave:", _ciclos_sin_wave)
+        cerrar_espnow(en)
+        # Re-escanear canal si llevamos demasiados ciclos sin contacto
+        if _ciclos_sin_wave >= CANAL_MISS_MAX:
+            backlight.value(1)
+            escanear_canal()
+            _ciclos_sin_wave = 0
+        ui_sleep_screen()
+        lightsleep(SLEEP_MS)
+        return
+
+    # ── Paso 4: Medir fresco para la WAVE ──────
+    ui_nodo(t, h, mq, ax, ay,
+            status="WAVE recibida", status_col=VERDE)
+    med_fresh, (t2, h2, mq2, ax2, ay2) = leer_sensores()
+    ui_nodo(t2, h2, mq2, ax2, ay2,
+            status="Conectado: " + parent_id[:14], status_col=VERDE)
+    utime.sleep_ms(300)
+
+    # ── Paso 5: Propagar WAVE a hijos ──────────
+    # SIEMPRE propagamos si ttl>1, independientemente del target.
+    # Esto permite que REQ:SLAVE_N llegue a través de nodos intermedios.
+    if wave_ttl > 1:
+        wave_hijos = json.dumps({
+            "type"  : "WAVE",
+            "cmd"   : wave_cmd,
+            "from"  : NODE_ID,
+            "target": target,
+            "ttl"   : wave_ttl - 1,
+            "ch"    : _canal_actual
+        })
+        _barra_status("Propagando ttl:{}".format(wave_ttl - 1), AMARILLO)
+        en.send(BROADCAST_MAC, wave_hijos)
+        utime.sleep_ms(120)
+        en.send(BROADCAST_MAC, wave_hijos)
+        del wave_hijos
+        print("[WAVE] Propagada ttl:", wave_ttl - 1)
+
+    gc.collect()
+
+    # ── Paso 6: Escuchar FBs de hijos ──────────
+    _barra_status("Esperando hijos...", CYAN)
+    hijos_detectados = []
+    fb_ya_relayados  = []
+
+    fin_hijos = utime.ticks_add(utime.ticks_ms(), VENTANA_HIJOS_MS)
+    while utime.ticks_diff(fin_hijos, utime.ticks_ms()) > 0:
+        try: host, msg = en.recv(20)
+        except: continue
+        if not msg: continue
+        try:
+            txt  = msg.decode()
+            data = json.loads(txt)
+            if data.get("type") == "FB":
+                hijo_id  = data.get("id", "?")
+                hijo_par = data.get("par", "")
+                if hijo_par == NODE_ID:
+                    if hijo_id not in hijos_detectados:
+                        hijos_detectados.append(hijo_id)
+                        _barra_status("Hijo: " + hijo_id, VERDE)
+                    if hijo_id not in fb_ya_relayados:
+                        fb_ya_relayados.append(hijo_id)
+                        relay_fb_hijo(en, txt)
+            del data, txt
+        except: pass
+
+    gc.collect()
+
+    gc.collect()
+
+    # ── Paso 7: Enviar FB propio SOLO si soy el target ──
+    # Si target == "ALL" → todos respondemos
+    # Si target == NODE_ID → solo yo respondo
+    # Si target == otro nodo → solo propagué la WAVE, no envío FB propio
+    debe_responder = (target == "ALL" or target == NODE_ID)
+    if debe_responder:
+        _rol = "NODO ({} hijos)".format(len(hijos_detectados)) if hijos_detectados else "HOJA"
+        pl_envio = payload_completo(med_fresh)
+        enviar_fb(en, pl_envio, parent_id)
+        ui_nodo(t2, h2, mq2, ax2, ay2,
+                status="FB ok | " + _rol, status_col=VERDE)
+    else:
+        _rol = "RELAY (target:{})".format(target[:8])
+        ui_nodo(t2, h2, mq2, ax2, ay2,
+                status="Solo relay (no soy target)", status_col=GRIS)
+        print("[NO RESPONDE] target era:", target)
+    utime.sleep_ms(800)
+
+    # ── Paso 8: Cerrar radio y dormir ──────────
+    cerrar_espnow(en)
+    ui_sleep_screen()
+    print("[Sleep] {} | {} | {}s | RAM:{}".format(
+        NODE_ID, _rol, SLEEP_MS // 1000, gc.mem_free()))
+    lightsleep(SLEEP_MS)
+    print("[Wake]", NODE_ID)
+
+# ───────────────────────────────────────────────
+#  ARRANQUE Y BUCLE PRINCIPAL
+# ───────────────────────────────────────────────
+ui_bienvenida()
+gc.collect()
+
+# Auto-detectar sensor principal (DHT11 vs MQ135)
+backlight.value(1)
+detectar_sensor()
+ui_modo_detectado()
+gc.collect()
+
+# Escaneo inicial de canal
+_sta.active(True)
+escanear_canal()
+_sta.active(False)
+gc.collect()
+
+while True:
+    try:
+        forzar = btn_der.value() == 0
+        ciclo(forzar=forzar)
+    except Exception as e:
+        print("[ERROR]", e)
+        tft.fill(NEGRO)
+        tft.write(font_sm, NODE_ID,        4,  4,  CYAN)
+        tft.write(font_md, "ERROR",         4, 28,  ROJO)
+        tft.write(font_sm, str(e)[:26],     4, 64,  BLANCO)
+        tft.write(font_sm, "REINICIANDO",   4, 108, AMARILLO)
+        backlight.value(1)
+        utime.sleep_ms(3000)
+        machine.reset()

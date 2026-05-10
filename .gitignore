@@ -1,0 +1,40 @@
+# Python / MicroPython
+__pycache__/
+*.pyc
+*.pyo
+
+# Arduino IDE
+build/
+*.hex
+*.elf
+*.bin
+*.map
+*.o
+*.d
+*.a
+.build/
+.cache/
+
+# Arduino IDE 2.x
+.theia/
+
+# PlatformIO (por si lo llegas a usar)
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*~
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Variables de entorno / secretos
+*.env
+secrets.py
+config_local.py
