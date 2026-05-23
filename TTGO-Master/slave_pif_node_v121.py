@@ -1,10 +1,10 @@
 # ============================================================
-#  PIF_NODE v11.11 — Plantilla Universal / LAB-ARTE
+#  PIF_NODE v12.1 — Plantilla Universal / LAB-ARTE
 #
 #  ★ ÚNICO PARÁMETRO A CAMBIAR POR DISPOSITIVO ★
 #    NODE_ID = "SLAVE_XX"
 #
-#  Cambios vs v11.10:
+#  Cambios vs v12.0:
 #    [NUEVO 1] Display apagado por defecto. Se prende SOLO en:
 #                (a) WAVE recibida cuyo target soy yo (o ALL)
 #                (b) botón derecho (medición forzada)
@@ -576,7 +576,7 @@ def ui_bienvenida():
     tft.write(font_md, "PIF NODE",  cx(font_md, "PIF NODE"),  4,  VERDE)
     tft.write(font_sm, "LAB-ARTE",  cx(font_sm, "LAB-ARTE"),  44, CYAN)
     tft.write(font_sm, NODE_ID,     cx(font_sm, NODE_ID),     68, AMARILLO)
-    modo = "SIEMPRE ON" if MODO_SIEMPRE_DESPIERTO else "v11.11 sleep"
+    modo = "SIEMPRE ON" if MODO_SIEMPRE_DESPIERTO else "v12.1 sleep"
     tft.write(font_sm, modo,        cx(font_sm, modo),        92, GRIS)
     prender_display()
     utime.sleep_ms(2000)
