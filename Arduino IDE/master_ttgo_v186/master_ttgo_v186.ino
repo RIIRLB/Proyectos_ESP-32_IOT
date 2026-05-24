@@ -1,5 +1,22 @@
 // ============================================================
-//  MASTER_TTGO v18.4 — PIF Mesh / LAB-ARTE
+//  MASTER_TTGO v18.6 — PIF Mesh / LAB-ARTE
+//
+//  Cambios vs v18.5:
+//    [FIX] El master ya NO mide su DHT11 cada 60s. Eso era inconsistente
+//          con los slaves (que miden cada 10 min) y saturaba la tabla
+//          del servidor.
+//          Ahora:
+//            - Cada T_HB_MQTT (60s): heartbeat = STATUS + PULSE (sin medición).
+//              El servidor usa esto para saber que el master está vivo.
+//            - Cada T_MEDICION_PROPIA (10 min): mide DHT11 y publica.
+//              Igual cadencia que los slaves.
+//            - Botón derecho / REQ:ALL / arranque: mide on-demand.
+//            - Modo alerta (cuando T>=45°C o H<=15%): manda cada ~10s.
+//              Esto lo controla evaluarAlertasMaster() en v18.5.
+//
+//  Cambios vs v18.4:
+//    [PREV] Propagación de alertas de slaves al servidor (línea ALERT).
+//    [PREV] Alertas propias del master con histéresis (45/60°C, 15/8%).
 //  Arduino C++ port — TTGO T-Display
 //
 //  Cambios vs v18.3:
@@ -65,8 +82,10 @@ const unsigned long T_HTTP_POLL    = 3000;   // ms entre polls HTTP
 const unsigned long T_HEARTBEAT    = 8000;
 const unsigned long T_PANTALLA     = 600000; // 10 min
 const unsigned long T_BEACON       = 60000;  // WAVE-beacon cada 60s
-const unsigned long T_HB_MQTT      = 60000;  // heartbeat MQTT cada 60s
-const unsigned long T_DISPLAY_ON   = 8000;   // [NUEVO 2] display 8s por evento
+const unsigned long T_HB_MQTT      = 60000;  // heartbeat MQTT cada 60s (solo PULSE+STATUS)
+const unsigned long T_MEDICION_PROPIA = 600000;  // [v18.6] DHT11 cada 10 min como slaves
+const unsigned long T_CHECK_ALERTA    = 30000;   // [v18.6] check DHT11 para alertas cada 30s
+const unsigned long T_DISPLAY_ON   = 8000;
 const int           BROADCAST_N    = 3;
 const int           TZ_OFFSET_HRS  = -6;
 
@@ -117,6 +136,8 @@ unsigned long ultimoHeartbeat = 0;
 unsigned long ultimaPantalla = 0;
 unsigned long ultimoBeacon = 0;
 unsigned long ultimoHbMqtt = 0;
+unsigned long ultimaMedicionPropia = 0;   // [v18.6] medición DHT11 cada 10 min
+unsigned long ultimoCheckAlerta = 0;      // [v18.6] check DHT11 para alertas cada 30s
 
 // [NUEVO 2] Display gestionado: se prende solo en eventos y se apaga solo.
 bool          displayPrendido = false;
@@ -126,6 +147,23 @@ unsigned long displayApagaEn  = 0;   // millis() en que toca apagar
 float ultTempMaster = NAN;
 float ultHumMaster  = NAN;
 unsigned long ultMedicionMaster = 0;
+
+// [NUEVO v18.5] Umbrales para alertas propias del master. Deben coincidir
+// con los del slave (UMBRALES en sens.py) para consistencia visual.
+const float TEMP_WARN = 45.0;
+const float TEMP_CRIT = 60.0;
+const float TEMP_WARN_SALE = 42.0;
+const float TEMP_CRIT_SALE = 55.0;
+const float HUM_WARN_BAJO = 15.0;
+const float HUM_CRIT_BAJO =  8.0;
+const float HUM_WARN_BAJO_SALE = 18.0;
+const float HUM_CRIT_BAJO_SALE = 11.0;
+
+// Estado de alerta propia (lo que el master mismo está reportando)
+String nivelAlertaMaster = "";   // "", "WARN", "CRIT"
+String sensoresAlertaMaster = ""; // "Temp" o "Temp,Hum" etc.
+unsigned long ultimaAlertaMasterTx = 0;
+const unsigned long T_ALERT_REPEAT_MS = 10000;   // re-enviar cada 10s mientras dure
 
 // [FIX 6] Dedup global de FBs por (mid, nodo) con TTL
 struct FbProcesado {
@@ -245,7 +283,96 @@ bool medirDht11Master() {
 }
 
 // ───────────────────────────────────────────────
-//  [NUEVO 1] Encolar medición del master para subir a MQTT
+//  [NUEVO 1] Encolar línea ALERT al servidor.
+//  Formato: "ts,nodo,ALERT,NIVEL:Sensor1,Sensor2"
+//  El servidor parsea esto aparte de las mediciones normales.
+// ───────────────────────────────────────────────
+void encolarAlerta(const String& ts, const String& nodo,
+                   const String& nivel, const String& sensores) {
+  String l = ts + "," + nodo + ",ALERT," + nivel + ":" + sensores;
+  encolarSubida(l);
+  Serial.printf("[ALERT TX] %s %s sensores:%s\n",
+                nodo.c_str(), nivel.c_str(), sensores.c_str());
+}
+
+// ───────────────────────────────────────────────
+//  [NUEVO 2] Evalúa alertas del DHT11 propio del master.
+//  Usa histéresis igual que los slaves. Si hay alerta nueva o cambio
+//  de nivel, encola ALERT al servidor. Mientras dure la alerta, re-
+//  manda cada T_ALERT_REPEAT_MS para que el servidor no la "olvide".
+// ───────────────────────────────────────────────
+void evaluarAlertasMaster() {
+  if (isnan(ultTempMaster) || isnan(ultHumMaster)) return;
+
+  String nuevoNivel = "";
+  String sensores = "";
+
+  // Temperatura (con histéresis)
+  if (ultTempMaster >= TEMP_CRIT) {
+    nuevoNivel = "CRIT";
+    sensores += "Temp";
+  } else if (nivelAlertaMaster == "CRIT" && ultTempMaster >= TEMP_CRIT_SALE) {
+    nuevoNivel = "CRIT";
+    sensores += "Temp";
+  } else if (ultTempMaster >= TEMP_WARN) {
+    if (nuevoNivel != "CRIT") nuevoNivel = "WARN";
+    if (sensores.indexOf("Temp") < 0) {
+      if (sensores.length() > 0) sensores += ",";
+      sensores += "Temp";
+    }
+  } else if (nivelAlertaMaster.length() > 0 && ultTempMaster >= TEMP_WARN_SALE) {
+    if (nuevoNivel != "CRIT") nuevoNivel = "WARN";
+    if (sensores.indexOf("Temp") < 0) {
+      if (sensores.length() > 0) sensores += ",";
+      sensores += "Temp";
+    }
+  }
+
+  // Humedad baja (con histéresis)
+  if (ultHumMaster <= HUM_CRIT_BAJO) {
+    nuevoNivel = "CRIT";
+    if (sensores.indexOf("Hum") < 0) {
+      if (sensores.length() > 0) sensores += ",";
+      sensores += "Hum";
+    }
+  } else if (ultHumMaster <= HUM_WARN_BAJO) {
+    if (nuevoNivel != "CRIT") nuevoNivel = "WARN";
+    if (sensores.indexOf("Hum") < 0) {
+      if (sensores.length() > 0) sensores += ",";
+      sensores += "Hum";
+    }
+  }
+
+  String ts = horaLocal(true);
+  bool cambio = (nuevoNivel != nivelAlertaMaster);
+  bool tocaRepetir = (nuevoNivel.length() > 0 &&
+                      millis() - ultimaAlertaMasterTx > T_ALERT_REPEAT_MS);
+
+  if (cambio || tocaRepetir) {
+    if (nuevoNivel.length() > 0) {
+      encolarAlerta(ts, CLIENT_ID, nuevoNivel, sensores);
+      ultimaAlertaMasterTx = millis();
+    } else if (nivelAlertaMaster.length() > 0) {
+      encolarAlerta(ts, CLIENT_ID, "OK", "-");
+      Serial.println("[ALERT] master salió de alerta");
+    }
+  }
+  nivelAlertaMaster = nuevoNivel;
+  sensoresAlertaMaster = sensores;
+}
+
+// ───────────────────────────────────────────────
+//  [v18.6] Encolar PULSE — heartbeat sin medición.
+//  El servidor sabe que el master sigue vivo, pero NO se guarda
+//  como una medición en la tabla (el servidor lo filtra).
+// ───────────────────────────────────────────────
+void encolarPulse(const String& ts) {
+  String l = ts + "," + CLIENT_ID + ",PULSE,ok";
+  encolarSubida(l);
+}
+
+// ───────────────────────────────────────────────
+//  Encolar medición del master + evaluar alertas
 // ───────────────────────────────────────────────
 void encolarMedicionMaster(const String& ts) {
   String l;
@@ -254,6 +381,8 @@ void encolarMedicionMaster(const String& ts) {
     dtostrf(ultTempMaster, 0, 1, tBuf);
     dtostrf(ultHumMaster,  0, 1, hBuf);
     l = ts + "," + CLIENT_ID + ",T:" + tBuf + " H:" + hBuf + ",sensor";
+    // [NUEVO 2] Evaluar alertas propias tras cada medición exitosa
+    evaluarAlertasMaster();
   } else {
     l = ts + "," + CLIENT_ID + ",T:-- H:--,sensor";
   }
@@ -431,6 +560,23 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     }
     Serial.printf("[<<< FB RX] nodo:%s par:%s mid:%lu ruta:%s\n",
                   nodo.c_str(), par.c_str(), (unsigned long)mid, ruta.c_str());
+
+    // [v18.5] Detectar alerta en el FB y propagar al servidor.
+    // El campo "alert" es ahora un string: "WARN" o "CRIT" (antes era bool).
+    const char* nivel = doc["alert"] | (const char*)nullptr;
+    if (nivel) {
+      JsonArray aT = doc["a_t"].as<JsonArray>();
+      String sensores = "";
+      if (aT) {
+        for (size_t i = 0; i < aT.size(); i++) {
+          if (i > 0) sensores += ",";
+          sensores += aT[i].as<String>();
+        }
+      } else {
+        sensores = "?";
+      }
+      encolarAlerta(ts, nodo, String(nivel), sensores);
+    }
 
     // [NUEVO 2] FB recibido → prender display
     prenderDisplay();
@@ -730,7 +876,7 @@ void uiBienvenida() {
   tft.println("LAB-ARTE");
   tft.setTextColor(COLOR_AMARILLO, COLOR_NEGRO);
   tft.setCursor(10, 90);
-  tft.println("v18.4 / C++");
+  tft.println("v18.6 / C++");
   prenderDisplay();
   delay(2000);
 }
@@ -740,7 +886,7 @@ void uiStatus(const char* l1, const char* l2, uint16_t c1, uint16_t c2) {
   tft.setTextSize(2);
   tft.setTextColor(COLOR_VERDE, COLOR_NEGRO);
   tft.setCursor(4, 4);
-  tft.print("PIF MASTER v18.4");
+  tft.print("PIF MASTER v18.6");
   tft.setTextColor(c1, COLOR_NEGRO);
   tft.setCursor(4, 30);
   tft.print(l1);
@@ -761,7 +907,7 @@ void uiHeartbeat() {
   tft.setTextSize(2);
   tft.setTextColor(COLOR_VERDE, COLOR_NEGRO);
   tft.setCursor(4, 4);
-  tft.print("Master v18.4");
+  tft.print("Master v18.6");
 
   tft.setTextSize(1);
   tft.setTextColor(COLOR_GRIS, COLOR_NEGRO);
@@ -842,7 +988,7 @@ void pollBotones() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== PIF MASTER v18.4 / Arduino C++ ===");
+  Serial.println("\n=== PIF MASTER v18.6 / Arduino C++ ===");
 
   pinMode(PIN_BACKLIGHT, OUTPUT);
   pinMode(PIN_BTN_LEFT,  INPUT_PULLUP);
@@ -880,7 +1026,16 @@ void setup() {
 
   uiStatus("Listo", "PIF Mesh activo", COLOR_VERDE, COLOR_GRIS);
   delay(1500);
-  // [NUEVO 2] el display se apagará solo a los 8s
+  // [v18.6] Una medición inicial para que la tarjeta del master arranque con datos
+  // en lugar de "T:-- H:--". Si falla, queda NaN y se reintentará en el primer check.
+  Serial.println("[SETUP] medición inicial DHT11...");
+  delay(2000);  // DHT11 necesita ~1s tras boot para estabilizarse
+  if (medirDht11Master()) {
+    String ts = horaLocal(true);
+    encolarMedicionMaster(ts);
+    publicarMqtt();
+    ultimaMedicionPropia = millis();
+  }
   Serial.println("[OK] Master listo, entrando al loop\n");
 }
 
@@ -945,15 +1100,40 @@ void loop() {
     enviarBeacon();
   }
 
-  // [NUEVO 1] Heartbeat MQTT cada T_HB_MQTT — ahora incluye medición propia
+  // [v18.6] Heartbeat MQTT cada T_HB_MQTT — solo PULSE + STATUS, SIN medición.
+  // Mantiene al servidor sabiendo que el master sigue vivo y le da topología.
   if (millis() - ultimoHbMqtt > T_HB_MQTT) {
     ultimoHbMqtt = millis();
     if (WiFi.status() == WL_CONNECTED) {
       String ts = horaLocal(true);
-      encolarMedicionMaster(ts);       // medición propia automática
+      encolarPulse(ts);                // [v18.6] heartbeat sin medir
       encolarStatus(ts);
       publicarMqtt();
     }
+  }
+
+  // [v18.6] Medición propia del DHT11 cada T_MEDICION_PROPIA (10 min).
+  // Mismo ritmo que los slaves. Si hay alerta activa, evaluarAlertasMaster()
+  // ya manda con frecuencia alta (~10s) por su cuenta dentro de encolarMedicionMaster.
+  if (millis() - ultimaMedicionPropia > T_MEDICION_PROPIA) {
+    ultimaMedicionPropia = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      String ts = horaLocal(true);
+      encolarMedicionMaster(ts);
+      publicarMqtt();
+    }
+  }
+
+  // [v18.6] Check rápido de alertas cada 30s, SIN publicar medición.
+  // Solo lee el DHT11 y llama a evaluarAlertasMaster(), que internamente
+  // decide si encola una línea ALERT (al cambiar nivel o cada T_ALERT_REPEAT_MS).
+  // Esto permite detectar fuego sin esperar 10 minutos a la próxima medición.
+  if (millis() - ultimoCheckAlerta > T_CHECK_ALERTA) {
+    ultimoCheckAlerta = millis();
+    if (medirDht11Master()) {       // actualiza ultTempMaster/ultHumMaster
+      evaluarAlertasMaster();       // encola ALERT si aplica
+    }
+    if (colaSubidaCount > 0) publicarMqtt();
   }
 
   // ── Heartbeat (solo serial; UI solo si display ya está prendido) ──
