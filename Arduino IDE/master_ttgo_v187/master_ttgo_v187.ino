@@ -1,5 +1,12 @@
 // ============================================================
-//  MASTER_TTGO v18.6 — PIF Mesh / LAB-ARTE
+//  MASTER_TTGO v18.7 — PIF Mesh / LAB-ARTE
+//
+//  Cambios vs v18.6:
+//    [NUEVO] Identificador de red NET_ID="PIFNET" en todos los WAVE/FB.
+//            El master ignora cualquier paquete entrante cuyo "net" no
+//            coincida. Esto evita que se mezcle con la malla de otra
+//            persona que use ESP-NOW cerca (interferencia entre proyectos).
+//            Debe coincidir con el NET_ID de los slaves (v12.3+).
 //
 //  Cambios vs v18.5:
 //    [FIX] El master ya NO mide su DHT11 cada 60s. Eso era inconsistente
@@ -76,6 +83,10 @@ const char* MQTT_BROKER = "192.168.1.146";
 const int   MQTT_PORT   = 1883;
 const char* CLIENT_ID   = "MASTER_TTGO_GATEWAY";
 const char* TOPIC_PUB   = "datos/sensores";
+// [v18.7] Identificador de red. Debe ser idéntico en master y todos los
+// slaves. Los paquetes con otro "net" se ignoran. Esto evita que tu malla
+// se mezcle con la de otra persona que use ESP-NOW cerca de ti.
+const char* NET_ID      = "PIFNET";
 
 const unsigned long T_MESH_LISTEN  = 5000;   // ms
 const unsigned long T_HTTP_POLL    = 3000;   // ms entre polls HTTP
@@ -495,6 +506,14 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   const char* tipo = doc["type"];
   if (!tipo) return;
 
+  // [v18.7] Filtro de red: ignorar paquetes que no sean de nuestra malla.
+  // Esto evita que el master procese FBs de otra persona usando ESP-NOW cerca.
+  const char* net = doc["net"] | (const char*)nullptr;
+  if (!net || strcmp(net, NET_ID) != 0) {
+    // Paquete de otra red (o sin net) — ignorar silenciosamente
+    return;
+  }
+
   if (strcmp(tipo, "FB") == 0 || strcmp(tipo, "FEEDBACK") == 0) {
     String nodo = doc["id"] | "?";
     String par  = doc["par"] | "?";
@@ -705,6 +724,7 @@ bool consultarHttp() {
 
       StaticJsonDocument<320> wave;
       wave["type"]   = "WAVE";
+      wave["net"]    = NET_ID;             // [v18.7]
       wave["cmd"]    = txt;
       wave["from"]   = CLIENT_ID;
       wave["target"] = target;
@@ -775,6 +795,7 @@ void publicarMqtt() {
 void enviarWave(const char* cmd, const char* target, uint32_t mid) {
   StaticJsonDocument<320> doc;
   doc["type"]   = "WAVE";
+  doc["net"]    = NET_ID;             // [v18.7]
   doc["cmd"]    = cmd;
   doc["from"]   = CLIENT_ID;
   doc["target"] = target;
@@ -805,6 +826,7 @@ void enviarWave(const char* cmd, const char* target, uint32_t mid) {
 void enviarBeacon() {
   StaticJsonDocument<256> doc;
   doc["type"]   = "WAVE";
+  doc["net"]    = NET_ID;             // [v18.7]
   doc["cmd"]    = "BEACON";
   doc["from"]   = CLIENT_ID;
   doc["target"] = "NONE";   // ningún slave responde
@@ -876,7 +898,7 @@ void uiBienvenida() {
   tft.println("LAB-ARTE");
   tft.setTextColor(COLOR_AMARILLO, COLOR_NEGRO);
   tft.setCursor(10, 90);
-  tft.println("v18.6 / C++");
+  tft.println("v18.7 / C++");
   prenderDisplay();
   delay(2000);
 }
@@ -886,7 +908,7 @@ void uiStatus(const char* l1, const char* l2, uint16_t c1, uint16_t c2) {
   tft.setTextSize(2);
   tft.setTextColor(COLOR_VERDE, COLOR_NEGRO);
   tft.setCursor(4, 4);
-  tft.print("PIF MASTER v18.6");
+  tft.print("PIF MASTER v18.7");
   tft.setTextColor(c1, COLOR_NEGRO);
   tft.setCursor(4, 30);
   tft.print(l1);
@@ -907,7 +929,7 @@ void uiHeartbeat() {
   tft.setTextSize(2);
   tft.setTextColor(COLOR_VERDE, COLOR_NEGRO);
   tft.setCursor(4, 4);
-  tft.print("Master v18.6");
+  tft.print("Master v18.7");
 
   tft.setTextSize(1);
   tft.setTextColor(COLOR_GRIS, COLOR_NEGRO);
@@ -988,7 +1010,7 @@ void pollBotones() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== PIF MASTER v18.6 / Arduino C++ ===");
+  Serial.println("\n=== PIF MASTER v18.7 / Arduino C++ ===");
 
   pinMode(PIN_BACKLIGHT, OUTPUT);
   pinMode(PIN_BTN_LEFT,  INPUT_PULLUP);

@@ -64,11 +64,11 @@
 // ───────────────────────────────────────────────
 //  CONFIGURACIÓN — ajustar según red activa
 // ───────────────────────────────────────────────
-const char* WIFI_SSID   = "Totalplay-C5AC";
-const char* WIFI_PASS   = "C5AC642BDVePRn6Z";
-const char* SERVER_IP   = "192.168.100.132";
+const char* WIFI_SSID   = "Arte_Tenda2.4";
+const char* WIFI_PASS   = "Lab4rt3#";
+const char* SERVER_IP   = "192.168.1.146";
 const int   SERVER_PORT = 5000;
-const char* MQTT_BROKER = "192.168.100.132";
+const char* MQTT_BROKER = "192.168.1.146";
 const int   MQTT_PORT   = 1883;
 const char* CLIENT_ID   = "MASTER_TTGO_GATEWAY";
 const char* TOPIC_PUB   = "datos/sensores";
